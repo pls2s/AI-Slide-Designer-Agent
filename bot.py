@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import zipfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,7 @@ from telegram.ext import (
 from config import SUPPORTED_AI_PROVIDERS, Settings, configure_logging, get_settings
 from slide_generator import SlideImageGenerationError, SlideImageGenerator
 from slide_analyzer import SlideAnalysisError, SlideAnalyzer, UnsupportedImageError
-from slide_renderer import SlideRenderError, UnsupportedPdfError, render_pdf_first_page
+from slide_renderer import SlideRenderError, UnsupportedPdfError, render_pdf_pages
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ START_MESSAGE = """
 หรือส่งไฟล์ PDF draft ของสไลด์มา เพื่อให้ผมสร้างภาพสไลด์ตกแต่งใหม่ให้สวยขึ้น
 
 ใช้ /provider เพื่อเลือก AI API ระหว่าง Gemini กับ GPT
+ใช้ /deckstart ก่อนส่งสไลด์ชุดเดียวกัน เพื่อ lock style ให้ทั้ง deck
 """.strip()
 
 HELP_MESSAGE = """
@@ -50,13 +52,18 @@ HELP_MESSAGE = """
 
 สร้างภาพตกแต่งจาก PDF:
 1. ส่งไฟล์ PDF draft ของสไลด์
-2. ระบบจะใช้หน้าแรกของ PDF เป็น reference
-3. รับไฟล์ภาพ PNG ของสไลด์ที่ตกแต่งให้ดูสวยขึ้น
+2. ระบบจะแปลงทุกหน้าของ PDF เป็น reference
+3. รับไฟล์ ZIP รวมภาพ PNG ของทุกสไลด์ที่ตกแต่งให้ดูสวยขึ้น
+
+ทำ style ให้ทั้ง deck เหมือนกัน:
+* /deckstart เริ่ม deck mode แล้วส่งสไลด์หน้าแรกเพื่อบันทึก style
+* /deckstatus ดู style ที่ใช้อยู่
+* /deckclear ล้าง style เมื่อจบ deck
 
 คำแนะนำ:
 * ใช้ภาพที่คมชัดและเห็นทั้งสไลด์
 * ถ้าเป็น deck หลายหน้า ให้ส่งทีละภาพ
-* ถ้าเป็น PDF หลายหน้า ระบบจะใช้หน้าแรกก่อน
+* ถ้าเป็น PDF หลายหน้า ระบบจะสร้างภาพกลับมาทุกหน้า
 * หลีกเลี่ยงภาพที่ถูก crop หรือเบลอมาก
 """.strip()
 
@@ -73,6 +80,13 @@ class FileAttachment:
     file_id: str
     file_name: str
     file_size: int | None
+
+
+@dataclass(slots=True)
+class DeckStyleState:
+    active: bool = False
+    style_guide: str | None = None
+    slide_count: int = 0
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,6 +108,52 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _provider_selection_text(settings, provider),
         reply_markup=_provider_keyboard(settings, provider),
     )
+
+
+async def deck_start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    state = _get_deck_style_state(context, message.chat_id)
+    state.active = True
+    state.style_guide = None
+    state.slide_count = 0
+    await message.reply_text(
+        "เริ่ม deck mode แล้วครับ\n\n"
+        "ส่งสไลด์หน้าแรกของ deck นี้มา ระบบจะใช้หน้านั้นสร้าง style guide "
+        "แล้วบังคับใช้ theme เดียวกันกับสไลด์ถัดไป"
+    )
+
+
+async def deck_status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    state = _get_deck_style_state(context, message.chat_id)
+    await message.reply_text(_deck_status_text(state))
+
+
+async def deck_clear_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    state = _get_deck_style_state(context, message.chat_id)
+    state.active = False
+    state.style_guide = None
+    state.slide_count = 0
+    await message.reply_text("ล้าง deck style แล้วครับ สไลด์ถัดไปจะไม่ถูก lock theme")
 
 
 async def handle_provider_selection(
@@ -139,6 +199,7 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
     settings: Settings = context.application.bot_data["settings"]
     analyzer: SlideAnalyzer = context.application.bot_data["slide_analyzer"]
     provider = _get_selected_provider(context, message.chat_id, settings)
+    deck_state = _get_deck_style_state(context, message.chat_id)
 
     try:
         attachment = _extract_image_attachment(message)
@@ -157,8 +218,9 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     provider_label = settings.provider_label(provider)
+    deck_status = " และ deck style" if deck_state.active else ""
     status_message = await message.reply_text(
-        f"กำลังดาวน์โหลดและวิเคราะห์สไลด์ด้วย {provider_label}..."
+        f"กำลังดาวน์โหลดและวิเคราะห์สไลด์ด้วย {provider_label}{deck_status}..."
     )
     typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
 
@@ -172,7 +234,25 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             await telegram_file.download_to_drive(custom_path=image_path)
 
-            analysis = await analyzer.analyze_image(image_path, provider)
+            style_was_created = False
+            if deck_state.active and not deck_state.style_guide:
+                await status_message.edit_text(
+                    "กำลังอ่านและบันทึก style ของ deck จากสไลด์หน้าแรก..."
+                )
+                deck_state.style_guide = await analyzer.extract_deck_style(
+                    image_path,
+                    provider,
+                )
+                style_was_created = True
+
+            analysis = await analyzer.analyze_image(
+                image_path,
+                provider,
+                deck_state.style_guide if deck_state.active else None,
+            )
+            if deck_state.active:
+                deck_state.slide_count += 1
+                analysis = _with_deck_prefix(analysis, deck_state, style_was_created)
 
         await status_message.delete()
         await _reply_long_text(message, analysis)
@@ -223,10 +303,12 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     settings: Settings = context.application.bot_data["settings"]
+    analyzer: SlideAnalyzer = context.application.bot_data["slide_analyzer"]
     generator: SlideImageGenerator = context.application.bot_data[
         "slide_image_generator"
     ]
     provider = _get_selected_provider(context, message.chat_id, settings)
+    deck_state = _get_deck_style_state(context, message.chat_id)
 
     try:
         attachment = _extract_pdf_attachment(message)
@@ -245,8 +327,9 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     provider_label = settings.provider_label(provider)
+    deck_status = " และ deck style" if deck_state.active else ""
     status_message = await message.reply_text(
-        f"กำลังแปลง PDF และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}..."
+        f"กำลังแปลง PDF และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}{deck_status}..."
     )
     typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
 
@@ -269,20 +352,36 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 pdf_path,
                 reference_image_path,
             )
+
+            style_was_created = False
+            if deck_state.active and not deck_state.style_guide:
+                await status_message.edit_text(
+                    "กำลังอ่านและบันทึก style ของ deck จาก PDF หน้าแรก..."
+                )
+                deck_state.style_guide = await analyzer.extract_deck_style(
+                    reference_image_path,
+                    provider,
+                )
+                style_was_created = True
+
             await generator.generate_decorated_slide(
                 reference_image_path,
                 provider,
                 output_image_path,
+                deck_state.style_guide if deck_state.active else None,
             )
+            if deck_state.active:
+                deck_state.slide_count += 1
 
             await status_message.delete()
             with output_image_path.open("rb") as image_file:
                 await message.reply_document(
                     document=image_file,
                     filename="decorated-slide.png",
-                    caption=(
-                        "สร้างภาพสไลด์ตกแต่งจาก PDF หน้าแรกเรียบร้อยครับ "
-                        f"({provider_label})"
+                    caption=_decorated_slide_caption(
+                        provider_label,
+                        deck_state,
+                        style_was_created,
                     ),
                 )
     except UnsupportedPdfError:
@@ -344,10 +443,14 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["slide_analyzer"] = analyzer
     application.bot_data["slide_image_generator"] = generator
     application.bot_data["chat_ai_providers"] = {}
+    application.bot_data["deck_style_states"] = {}
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("provider", provider_command))
+    application.add_handler(CommandHandler("deckstart", deck_start_command))
+    application.add_handler(CommandHandler("deckstatus", deck_status_command))
+    application.add_handler(CommandHandler("deckclear", deck_clear_command))
     application.add_handler(
         CallbackQueryHandler(
             handle_provider_selection,
@@ -368,6 +471,22 @@ def _chat_provider_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, str]:
     return context.application.bot_data.setdefault("chat_ai_providers", {})
 
 
+def _deck_style_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, DeckStyleState]:
+    return context.application.bot_data.setdefault("deck_style_states", {})
+
+
+def _get_deck_style_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> DeckStyleState:
+    states = _deck_style_map(context)
+    state = states.get(chat_id)
+    if state is None:
+        state = DeckStyleState()
+        states[chat_id] = state
+    return state
+
+
 def _get_selected_provider(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -377,6 +496,60 @@ def _get_selected_provider(
     if provider and settings.is_provider_available(provider):
         return provider
     return settings.ai_provider
+
+
+def _deck_status_text(state: DeckStyleState) -> str:
+    if not state.active:
+        return "Deck mode ยังไม่ได้เปิดครับ ใช้ /deckstart เพื่อ lock style ให้ deck เดียวกัน"
+
+    if not state.style_guide:
+        return (
+            "Deck mode เปิดอยู่ แต่ยังไม่มี style guide\n\n"
+            "ส่งสไลด์หน้าแรกมา ระบบจะใช้หน้านั้นบันทึก style ของ deck"
+        )
+
+    return "\n".join(
+        [
+            "Deck mode เปิดอยู่",
+            f"ประมวลผลแล้ว: {state.slide_count} หน้า",
+            "",
+            state.style_guide,
+        ]
+    )
+
+
+def _with_deck_prefix(
+    text: str,
+    state: DeckStyleState,
+    style_was_created: bool,
+) -> str:
+    if style_was_created:
+        prefix = (
+            "บันทึก Deck Style จากสไลด์หน้าแรกแล้วครับ "
+            "สไลด์ถัดไปในแชตนี้จะใช้ theme เดียวกัน\n\n"
+        )
+    else:
+        prefix = (
+            f"ใช้ Deck Style เดิมสำหรับหน้า {state.slide_count} แล้วครับ\n\n"
+        )
+
+    return f"{prefix}{text}"
+
+
+def _decorated_slide_caption(
+    provider_label: str,
+    state: DeckStyleState,
+    style_was_created: bool,
+) -> str:
+    caption = (
+        "สร้างภาพสไลด์ตกแต่งจาก PDF หน้าแรกเรียบร้อยครับ "
+        f"({provider_label})"
+    )
+    if not state.active:
+        return caption
+    if style_was_created:
+        return f"{caption}\nบันทึก Deck Style แล้ว สไลด์ถัดไปจะใช้ theme เดียวกัน"
+    return f"{caption}\nใช้ Deck Style เดิมสำหรับหน้า {state.slide_count}"
 
 
 def _provider_selection_text(settings: Settings, selected_provider: str) -> str:

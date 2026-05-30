@@ -70,6 +70,48 @@ create a redesigned slide visual or supporting illustration.)
 """.strip()
 
 
+DECK_STYLE_EXTRACTION_PROMPT = """
+You are creating a reusable visual style guide for a slide deck.
+
+Look at the provided slide and extract a concise design system that can be
+applied consistently to later slides in the same deck.
+
+Return in English only. Do not critique the slide. Do not invent brand names,
+logos, facts, or exact fonts if they are not visible.
+
+Use this exact structure:
+
+Deck Style Guide:
+- Overall design direction:
+- Color palette:
+- Typography:
+- Layout system:
+- Visual elements:
+- Icon/illustration style:
+- Chart/table style:
+- Background treatment:
+- Spacing and alignment:
+- What to avoid:
+""".strip()
+
+
+def build_analysis_prompt(deck_style_guide: str | None = None) -> str:
+    if not deck_style_guide:
+        return SYSTEM_PROMPT
+
+    return f"""
+{SYSTEM_PROMPT}
+
+Deck Style Lock:
+Use the following deck style guide as a strict visual direction for this slide.
+For Theme Recommendation and the final English image-generation prompt, keep
+the same colors, typography direction, layout language, visual elements, and
+overall mood. Do not propose a conflicting new theme.
+
+{deck_style_guide}
+""".strip()
+
+
 SLIDE_DECORATION_PROMPT = """
 Use the provided slide draft as the main reference and create a polished,
 presentation-ready 16:9 slide image.
@@ -88,4 +130,21 @@ Design goals:
   placeholders that match the original structure.
 
 Return only the final redesigned slide image.
+""".strip()
+
+
+def build_slide_decoration_prompt(deck_style_guide: str | None = None) -> str:
+    if not deck_style_guide:
+        return SLIDE_DECORATION_PROMPT
+
+    return f"""
+{SLIDE_DECORATION_PROMPT}
+
+Deck Style Lock:
+Apply this exact deck style guide so the generated image matches the rest of
+the deck. Keep color palette, typography direction, layout system, decorative
+motifs, icon/illustration style, background treatment, spacing, and visual mood
+consistent. Do not switch to a different theme.
+
+{deck_style_guide}
 """.strip()

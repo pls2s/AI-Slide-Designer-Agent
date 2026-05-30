@@ -91,6 +91,17 @@ Use `/provider` in Telegram to choose the API for the current chat:
 
 The selection is stored in memory, so restarting the bot resets chats back to `AI_PROVIDER`.
 
+## Deck Style Lock
+
+Use deck mode when you want all slides in the same deck to keep one visual theme:
+
+1. Send `/deckstart`
+2. Send the first slide image or first PDF draft page. The bot saves its style guide.
+3. Send the rest of the deck one slide at a time. Theme recommendations and generated slide images will reuse the saved style.
+4. Send `/deckclear` when the deck is finished.
+
+Use `/deckstatus` to view the active style guide. Deck style is stored in memory, so restarting the bot clears it.
+
 ## PDF Decoration
 
 Send a PDF document to the bot. The bot will:

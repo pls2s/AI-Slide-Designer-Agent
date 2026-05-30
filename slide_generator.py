@@ -11,7 +11,7 @@ from google import genai
 from openai import OpenAI
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from prompts import SLIDE_DECORATION_PROMPT
+from prompts import build_slide_decoration_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -47,12 +47,14 @@ class SlideImageGenerator:
         reference_image_path: Path,
         provider: str,
         output_path: Path,
+        deck_style_guide: str | None = None,
     ) -> Path:
         return await asyncio.to_thread(
             self._generate_decorated_slide,
             reference_image_path,
             provider,
             output_path,
+            deck_style_guide,
         )
 
     def _generate_decorated_slide(
@@ -60,11 +62,13 @@ class SlideImageGenerator:
         reference_image_path: Path,
         provider: str,
         output_path: Path,
+        deck_style_guide: str | None,
     ) -> Path:
+        prompt = build_slide_decoration_prompt(deck_style_guide)
         if provider == "gemini":
-            return self._generate_gemini_image(reference_image_path, output_path)
+            return self._generate_gemini_image(reference_image_path, output_path, prompt)
         if provider == "gpt":
-            return self._generate_openai_image(reference_image_path, output_path)
+            return self._generate_openai_image(reference_image_path, output_path, prompt)
 
         raise SlideImageGenerationError(f"Unsupported AI provider: {provider}")
 
@@ -72,6 +76,7 @@ class SlideImageGenerator:
         self,
         reference_image_path: Path,
         output_path: Path,
+        prompt: str,
     ) -> Path:
         if not self._gemini_client:
             raise SlideImageGenerationError("Gemini image provider is not configured.")
@@ -85,7 +90,7 @@ class SlideImageGenerator:
         try:
             response = self._gemini_client.models.generate_content(
                 model=self._gemini_image_model,
-                contents=[SLIDE_DECORATION_PROMPT, reference_image],
+                contents=[prompt, reference_image],
             )
         except Exception as exc:
             raise SlideImageGenerationError("Gemini image generation failed.") from exc
@@ -104,6 +109,7 @@ class SlideImageGenerator:
         self,
         reference_image_path: Path,
         output_path: Path,
+        prompt: str,
     ) -> Path:
         if not self._openai_client:
             raise SlideImageGenerationError("GPT image provider is not configured.")
@@ -117,7 +123,7 @@ class SlideImageGenerator:
                 result = self._openai_client.images.edit(
                     model=self._openai_image_model,
                     image=[image_file],
-                    prompt=SLIDE_DECORATION_PROMPT,
+                    prompt=prompt,
                     size=OPENAI_SLIDE_SIZE,
                     quality=OPENAI_IMAGE_QUALITY,
                 )
