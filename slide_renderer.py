@@ -43,10 +43,3 @@ def render_pdf_pages(pdf_path: Path, output_dir: Path) -> list[Path]:
         raise SlideRenderError("Could not render the PDF pages.") from exc
     finally:
         document.close()
-
-
-def render_pdf_first_page(pdf_path: Path, output_path: Path) -> Path:
-    output_dir = output_path.parent / f"{output_path.stem}-pages"
-    rendered_paths = render_pdf_pages(pdf_path, output_dir)
-    output_path.write_bytes(rendered_paths[0].read_bytes())
-    return output_path

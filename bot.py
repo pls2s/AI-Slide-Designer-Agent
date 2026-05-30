@@ -329,7 +329,7 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     provider_label = settings.provider_label(provider)
     deck_status = " และ deck style" if deck_state.active else ""
     status_message = await message.reply_text(
-        f"กำลังแปลง PDF และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}{deck_status}..."
+        f"กำลังแปลง PDF ทั้ง deck และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}{deck_status}..."
     )
     typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
 
@@ -337,8 +337,10 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         with tempfile.TemporaryDirectory(prefix="ai-slide-designer-pdf-") as temp_dir:
             temp_path = Path(temp_dir)
             pdf_path = temp_path / attachment.file_name
-            reference_image_path = temp_path / "slide-draft-page-1.png"
-            output_image_path = temp_path / "decorated-slide.png"
+            reference_dir = temp_path / "rendered-pages"
+            output_dir = temp_path / "decorated-pages"
+            output_zip_path = temp_path / "decorated-slide-deck.zip"
+            output_dir.mkdir(parents=True, exist_ok=True)
 
             telegram_file = await context.bot.get_file(
                 attachment.file_id,
@@ -347,10 +349,10 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             await telegram_file.download_to_drive(custom_path=pdf_path)
 
-            await asyncio.to_thread(
-                render_pdf_first_page,
+            reference_image_paths = await asyncio.to_thread(
+                render_pdf_pages,
                 pdf_path,
-                reference_image_path,
+                reference_dir,
             )
 
             style_was_created = False
@@ -359,29 +361,40 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "กำลังอ่านและบันทึก style ของ deck จาก PDF หน้าแรก..."
                 )
                 deck_state.style_guide = await analyzer.extract_deck_style(
-                    reference_image_path,
+                    reference_image_paths[0],
                     provider,
                 )
                 style_was_created = True
 
-            await generator.generate_decorated_slide(
-                reference_image_path,
-                provider,
-                output_image_path,
-                deck_state.style_guide if deck_state.active else None,
-            )
+            output_image_paths: list[Path] = []
+            for page_index, reference_image_path in enumerate(reference_image_paths, 1):
+                await status_message.edit_text(
+                    "กำลังสร้างภาพสไลด์ตกแต่ง "
+                    f"{page_index}/{len(reference_image_paths)} ด้วย {provider_label}..."
+                )
+                output_image_path = output_dir / f"decorated-slide-{page_index:03}.png"
+                await generator.generate_decorated_slide(
+                    reference_image_path,
+                    provider,
+                    output_image_path,
+                    deck_state.style_guide if deck_state.active else None,
+                )
+                output_image_paths.append(output_image_path)
+
+            await asyncio.to_thread(_zip_files, output_image_paths, output_zip_path)
             if deck_state.active:
-                deck_state.slide_count += 1
+                deck_state.slide_count += len(reference_image_paths)
 
             await status_message.delete()
-            with output_image_path.open("rb") as image_file:
+            with output_zip_path.open("rb") as zip_file:
                 await message.reply_document(
-                    document=image_file,
-                    filename="decorated-slide.png",
-                    caption=_decorated_slide_caption(
+                    document=zip_file,
+                    filename="decorated-slide-deck.zip",
+                    caption=_decorated_deck_caption(
                         provider_label,
                         deck_state,
                         style_was_created,
+                        len(reference_image_paths),
                     ),
                 )
     except UnsupportedPdfError:
@@ -391,12 +404,12 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except SlideRenderError:
         logger.exception("PDF rendering failed")
         await status_message.edit_text(
-            "แปลง PDF เป็นภาพไม่สำเร็จครับ กรุณาลอง export หน้า slide เป็น PDF ใหม่"
+            "แปลง PDF เป็นภาพไม่สำเร็จครับ กรุณาลอง export deck เป็น PDF ใหม่"
         )
     except SlideImageGenerationError:
         logger.exception("Decorated slide image generation failed")
         await status_message.edit_text(
-            "สร้างภาพสไลด์ตกแต่งไม่สำเร็จครับ กรุณาลองส่ง PDF ที่ชัดขึ้นอีกครั้ง"
+            "สร้างภาพสไลด์ตกแต่งทั้ง deck ไม่สำเร็จครับ กรุณาลองส่ง PDF ที่ชัดขึ้นอีกครั้ง"
         )
     except TelegramError:
         logger.exception("Telegram API error while handling PDF")
@@ -536,20 +549,28 @@ def _with_deck_prefix(
     return f"{prefix}{text}"
 
 
-def _decorated_slide_caption(
+def _decorated_deck_caption(
     provider_label: str,
     state: DeckStyleState,
     style_was_created: bool,
+    page_count: int,
 ) -> str:
     caption = (
-        "สร้างภาพสไลด์ตกแต่งจาก PDF หน้าแรกเรียบร้อยครับ "
-        f"({provider_label})"
+        f"สร้างภาพสไลด์ตกแต่งจาก PDF ครบ {page_count} หน้าแล้วครับ "
+        f"({provider_label})\nส่งกลับเป็น ZIP รวมไฟล์ PNG ทุกหน้า"
     )
     if not state.active:
         return caption
     if style_was_created:
-        return f"{caption}\nบันทึก Deck Style แล้ว สไลด์ถัดไปจะใช้ theme เดียวกัน"
+        return f"{caption}\nบันทึก Deck Style แล้ว และใช้ theme เดียวกันทั้ง deck"
     return f"{caption}\nใช้ Deck Style เดิมสำหรับหน้า {state.slide_count}"
+
+
+def _zip_files(file_paths: list[Path], zip_path: Path) -> Path:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in file_paths:
+            archive.write(file_path, arcname=file_path.name)
+    return zip_path
 
 
 def _provider_selection_text(settings: Settings, selected_provider: str) -> str:

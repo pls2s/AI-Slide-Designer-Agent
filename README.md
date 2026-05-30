@@ -1,12 +1,12 @@
 # AI Slide Designer Agent
 
-MVP Telegram bot that analyzes PowerPoint slide screenshots/images with selectable Gemini or GPT vision APIs, and can turn the first page of a slide-draft PDF into a decorated presentation-ready PNG.
+MVP Telegram bot that analyzes PowerPoint slide screenshots/images with selectable Gemini or GPT vision APIs, and can turn every page of a slide-draft PDF into a decorated presentation-ready PNG deck.
 
 ## Features
 
 - `/start` and `/help` commands
 - Accepts slide images from Telegram photos or image documents
-- Accepts PDF slide drafts and renders the first page
+- Accepts PDF slide drafts and renders every page
 - Downloads and validates the uploaded image
 - Normalizes images with Pillow before analysis
 - Lets each chat choose AI provider with `/provider`
@@ -80,7 +80,7 @@ source .venv/bin/activate
 python bot.py
 ```
 
-The bot runs with Telegram long polling. Send it a slide screenshot/exported slide image for analysis, or a PDF slide draft to generate a decorated PNG.
+The bot runs with Telegram long polling. Send it a slide screenshot/exported slide image for analysis, or a PDF slide draft to generate a ZIP of decorated PNG slides.
 
 ## AI Provider Selection
 
@@ -96,8 +96,8 @@ The selection is stored in memory, so restarting the bot resets chats back to `A
 Use deck mode when you want all slides in the same deck to keep one visual theme:
 
 1. Send `/deckstart`
-2. Send the first slide image or first PDF draft page. The bot saves its style guide.
-3. Send the rest of the deck one slide at a time. Theme recommendations and generated slide images will reuse the saved style.
+2. Send the first slide image or a PDF draft. The bot saves its style guide from the first slide/page.
+3. Send the rest of the deck one slide at a time, or send a multi-page PDF. Theme recommendations and generated slide images will reuse the saved style.
 4. Send `/deckclear` when the deck is finished.
 
 Use `/deckstatus` to view the active style guide. Deck style is stored in memory, so restarting the bot clears it.
@@ -107,11 +107,11 @@ Use `/deckstatus` to view the active style guide. Deck style is stored in memory
 Send a PDF document to the bot. The bot will:
 
 1. Download the PDF from Telegram
-2. Render the first page to `slide-draft-page-1.png` with PyMuPDF
-3. Use the selected AI provider to generate a cleaner, decorated 16:9 slide image
-4. Return `decorated-slide.png` as a Telegram document to avoid image compression
+2. Render every page to `slide-draft-page-001.png`, `slide-draft-page-002.png`, etc. with PyMuPDF
+3. Use the selected AI provider to generate a cleaner, decorated 16:9 slide image for each page
+4. Return `decorated-slide-deck.zip` as a Telegram document to avoid image compression
 
-For multi-page PDFs, only page 1 is processed in this MVP.
+For multi-page PDFs, every page is processed sequentially. Large decks can take several minutes because each page requires a separate image-generation request.
 
 ## Gemini Integration
 
