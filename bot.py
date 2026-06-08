@@ -7,10 +7,11 @@ import zipfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,7 +22,11 @@ from telegram.ext import (
 )
 
 from config import SUPPORTED_AI_PROVIDERS, Settings, configure_logging, get_settings
-from slide_generator import SlideImageGenerationError, SlideImageGenerator
+from slide_generator import (
+    SlideImageGenerationError,
+    SlideImageGenerator,
+    SlideImageQuotaError,
+)
 from slide_analyzer import SlideAnalysisError, SlideAnalyzer, UnsupportedImageError
 from slide_renderer import SlideRenderError, UnsupportedPdfError, render_pdf_pages
 
@@ -40,6 +45,7 @@ START_MESSAGE = """
 หรือส่งไฟล์ PDF draft ของสไลด์มา เพื่อให้ผมสร้างภาพสไลด์ตกแต่งใหม่ให้สวยขึ้น
 
 ใช้ /provider เพื่อเลือก AI API ระหว่าง Gemini กับ GPT
+ใช้ /theme เพื่อเลือกธีมสไลด์ หรือ /themetemplate เพื่อส่งภาพธีมต้นแบบ
 ใช้ /deckstart ก่อนส่งสไลด์ชุดเดียวกัน เพื่อ lock style ให้ทั้ง deck
 """.strip()
 
@@ -47,8 +53,9 @@ HELP_MESSAGE = """
 วิธีใช้งาน:
 1. ส่งภาพสไลด์ 1 หน้าในรูปแบบ PNG, JPG, JPEG หรือ WebP
 2. ใช้ /provider เพื่อเลือก Gemini (ฟรี/โควตาฟรี) หรือ GPT (เสียเงิน)
-3. รอระบบวิเคราะห์สไลด์ด้วย AI provider ที่เลือก
-4. รับคะแนนสไลด์ จุดแข็ง ปัญหา ข้อเสนอแนะ Theme และ Prompt สำหรับสร้างภาพใหม่
+3. ใช้ /theme ถ้าต้องการเลือกธีม หรือ /themetemplate เพื่อส่งภาพต้นแบบ
+4. รอระบบวิเคราะห์สไลด์ด้วย AI provider ที่เลือก
+5. รับคะแนนสไลด์ จุดแข็ง ปัญหา ข้อเสนอแนะ Theme และ Prompt สำหรับสร้างภาพใหม่
 
 สร้างภาพตกแต่งจาก PDF:
 1. ส่งไฟล์ PDF draft ของสไลด์
@@ -56,6 +63,10 @@ HELP_MESSAGE = """
 3. รับไฟล์ ZIP รวมภาพ PNG ของทุกสไลด์ที่ตกแต่งให้ดูสวยขึ้น
 
 ทำ style ให้ทั้ง deck เหมือนกัน:
+* /theme เลือก preset theme ให้สไลด์ถัดไป
+* /themetemplate แล้วส่งภาพ/PDF ต้นแบบ เพื่อใช้เป็น theme
+* /themestatus ดู theme ที่ใช้อยู่
+* /themeclear ล้าง theme ที่เลือก
 * /deckstart เริ่ม deck mode แล้วส่งสไลด์หน้าแรกเพื่อบันทึก style
 * /deckstatus ดู style ที่ใช้อยู่
 * /deckclear ล้าง style เมื่อจบ deck
@@ -73,6 +84,7 @@ NON_IMAGE_MESSAGE = """
 """.strip()
 
 PROVIDER_CALLBACK_PREFIX = "provider:"
+THEME_CALLBACK_PREFIX = "theme:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +99,137 @@ class DeckStyleState:
     active: bool = False
     style_guide: str | None = None
     slide_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ThemePreset:
+    key: str
+    label: str
+    style_guide: str
+
+
+@dataclass(slots=True)
+class ThemeState:
+    active: bool = False
+    label: str | None = None
+    style_guide: str | None = None
+    awaiting_template: bool = False
+
+
+THEME_PRESETS = (
+    ThemePreset(
+        key="corporate",
+        label="Clean Corporate",
+        style_guide="""
+Deck Style Guide:
+- Overall design direction: clean corporate presentation with high clarity,
+  restrained visual accents, and strong business readability.
+- Color palette: white and very light gray backgrounds, deep navy text,
+  teal or blue accent lines, sparing use of warm highlight colors.
+- Typography: modern sans-serif, clear title hierarchy, medium-weight headings,
+  compact body text with generous line spacing.
+- Layout system: structured grids, left-aligned content, clear section headers,
+  balanced whitespace, and simple data callouts.
+- Visual elements: thin dividers, subtle geometric accents, clean icons,
+  charts with minimal decoration.
+- Icon/illustration style: outline or duotone business icons.
+- Chart/table style: simple axes, direct labels, restrained gridlines.
+- Background treatment: mostly flat light backgrounds with subtle panels.
+- Spacing and alignment: precise alignment and consistent margins.
+- What to avoid: busy gradients, decorative clutter, playful fonts, and low contrast.
+""".strip(),
+    ),
+    ThemePreset(
+        key="startup",
+        label="Bold Startup",
+        style_guide="""
+Deck Style Guide:
+- Overall design direction: energetic startup pitch deck with confident contrast,
+  bold sectioning, and modern product storytelling.
+- Color palette: charcoal or off-white base, electric blue, cyan, lime,
+  and coral accents used selectively.
+- Typography: bold sans-serif headlines, short punchy labels, clean body text.
+- Layout system: asymmetric but controlled layouts, large numbers,
+  strong callout blocks, and clear visual anchors.
+- Visual elements: accent bars, metric badges, product-style cards,
+  simplified diagrams, and strong CTA-style emphasis.
+- Icon/illustration style: modern filled or duotone icons with rounded geometry.
+- Chart/table style: big headline metrics, simplified comparison charts,
+  direct labels instead of dense legends.
+- Background treatment: subtle depth, soft shadows, and crisp accent shapes.
+- Spacing and alignment: roomy, presentation-ready spacing with clear focal points.
+- What to avoid: academic density, weak hierarchy, muted same-color-only palettes.
+""".strip(),
+    ),
+    ThemePreset(
+        key="academic",
+        label="Academic Minimal",
+        style_guide="""
+Deck Style Guide:
+- Overall design direction: academic and thesis-friendly slides with calm,
+  credible structure and strong readability.
+- Color palette: white background, slate or black text, one scholarly accent
+  color such as blue, green, or burgundy.
+- Typography: readable sans-serif or serif-like academic pairing, clear headings,
+  conservative body sizing.
+- Layout system: title at top, content grouped into logical blocks,
+  diagrams and tables with enough whitespace.
+- Visual elements: labeled diagrams, simple callout boxes, footnote areas,
+  restrained icons.
+- Icon/illustration style: minimal line icons only when they clarify meaning.
+- Chart/table style: precise labels, visible units, accessible contrast,
+  minimal decorative effects.
+- Background treatment: plain and clean with optional light section bands.
+- Spacing and alignment: consistent margins and disciplined alignment.
+- What to avoid: excessive decoration, illegible dense text, informal styling.
+""".strip(),
+    ),
+    ThemePreset(
+        key="premium",
+        label="Premium Pitch",
+        style_guide="""
+Deck Style Guide:
+- Overall design direction: premium investor or executive deck with polished
+  contrast, refined whitespace, and confident visual hierarchy.
+- Color palette: deep charcoal, black, ivory, metallic gold or champagne accents,
+  plus one cool supporting accent when needed.
+- Typography: elegant modern sans-serif, sharp title scale, concise text blocks.
+- Layout system: cinematic section layouts, large visual areas, strong margins,
+  selective premium callouts.
+- Visual elements: fine rules, elegant number treatments, subtle image overlays,
+  refined iconography.
+- Icon/illustration style: thin line icons or minimal premium pictograms.
+- Chart/table style: high-contrast labels, simplified executive summaries,
+  minimal gridlines.
+- Background treatment: dark or ivory flat backgrounds with restrained depth.
+- Spacing and alignment: generous whitespace and exact alignment.
+- What to avoid: cheap-looking gradients, overcrowded slides, inconsistent accents.
+""".strip(),
+    ),
+    ThemePreset(
+        key="workshop",
+        label="Workshop Bright",
+        style_guide="""
+Deck Style Guide:
+- Overall design direction: friendly workshop or classroom slides that feel
+  clear, approachable, and easy to follow.
+- Color palette: white or soft light base with balanced blue, green, coral,
+  and yellow accents.
+- Typography: friendly sans-serif, clear headings, readable body text,
+  short instructional labels.
+- Layout system: modular content blocks, step-by-step sections,
+  visible activity areas, and simple examples.
+- Visual elements: checklists, process arrows, soft highlight boxes,
+  simple illustrations.
+- Icon/illustration style: rounded line or filled icons with friendly proportions.
+- Chart/table style: simplified visuals with clear labels and color coding.
+- Background treatment: light and clean with soft section bands.
+- Spacing and alignment: comfortable spacing that supports scanning.
+- What to avoid: corporate stiffness, tiny text, overly decorative backgrounds.
+""".strip(),
+    ),
+)
+THEME_PRESET_BY_KEY = {preset.key: preset for preset in THEME_PRESETS}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,6 +251,56 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _provider_selection_text(settings, provider),
         reply_markup=_provider_keyboard(settings, provider),
     )
+
+
+async def theme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    theme_state = _get_theme_state(context, message.chat_id)
+    await message.reply_text(
+        _theme_selection_text(theme_state),
+        reply_markup=_theme_keyboard(theme_state),
+    )
+
+
+async def theme_template_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    theme_state = _get_theme_state(context, message.chat_id)
+    theme_state.awaiting_template = True
+    await message.reply_text(_theme_template_waiting_text())
+
+
+async def theme_status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    theme_state = _get_theme_state(context, message.chat_id)
+    await message.reply_text(_theme_status_text(theme_state))
+
+
+async def theme_clear_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    theme_state = _get_theme_state(context, message.chat_id)
+    _clear_theme_state(theme_state)
+    await message.reply_text("ล้าง theme แล้วครับ สไลด์ถัดไปจะใช้คำแนะนำแบบอิสระ")
 
 
 async def deck_start_command(
@@ -153,7 +346,14 @@ async def deck_clear_command(
     state.active = False
     state.style_guide = None
     state.slide_count = 0
-    await message.reply_text("ล้าง deck style แล้วครับ สไลด์ถัดไปจะไม่ถูก lock theme")
+    theme_state = _get_theme_state(context, message.chat_id)
+    if _has_active_theme(theme_state):
+        await message.reply_text(
+            f"ล้าง deck style แล้วครับ แต่ Theme: {_theme_label(theme_state)} ยังใช้อยู่"
+        )
+        return
+
+    await message.reply_text("ล้าง deck style แล้วครับ สไลด์ถัดไปจะใช้คำแนะนำแบบอิสระ")
 
 
 async def handle_provider_selection(
@@ -191,6 +391,49 @@ async def handle_provider_selection(
     )
 
 
+async def handle_theme_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+
+    chat = update.effective_chat
+    if chat is None:
+        await query.edit_message_text("เลือก theme ไม่สำเร็จครับ ใช้ /theme อีกครั้ง")
+        return
+
+    action = (query.data or "").removeprefix(THEME_CALLBACK_PREFIX)
+    theme_state = _get_theme_state(context, chat.id)
+
+    if action == "template":
+        theme_state.awaiting_template = True
+        await query.edit_message_text(_theme_template_waiting_text())
+        return
+
+    if action == "clear":
+        _clear_theme_state(theme_state)
+        await query.edit_message_text(
+            "ล้าง theme แล้วครับ สไลด์ถัดไปจะใช้คำแนะนำแบบอิสระ",
+            reply_markup=_theme_keyboard(theme_state),
+        )
+        return
+
+    preset = THEME_PRESET_BY_KEY.get(action)
+    if preset is None:
+        await query.edit_message_text("ตัวเลือก theme ไม่ถูกต้องครับ ใช้ /theme อีกครั้ง")
+        return
+
+    _set_theme_from_preset(theme_state, preset)
+    await query.edit_message_text(
+        _theme_selected_text(theme_state),
+        reply_markup=_theme_keyboard(theme_state),
+    )
+
+
 async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
@@ -200,6 +443,7 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
     analyzer: SlideAnalyzer = context.application.bot_data["slide_analyzer"]
     provider = _get_selected_provider(context, message.chat_id, settings)
     deck_state = _get_deck_style_state(context, message.chat_id)
+    theme_state = _get_theme_state(context, message.chat_id)
 
     try:
         attachment = _extract_image_attachment(message)
@@ -217,11 +461,26 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text(_missing_provider_key_text(settings, provider))
         return
 
+    if theme_state.awaiting_template:
+        await _capture_theme_template_from_image(
+            message,
+            context,
+            settings,
+            analyzer,
+            provider,
+            attachment,
+            theme_state,
+        )
+        return
+
     provider_label = settings.provider_label(provider)
-    deck_status = " และ deck style" if deck_state.active else ""
-    status_message = await message.reply_text(
-        f"กำลังดาวน์โหลดและวิเคราะห์สไลด์ด้วย {provider_label}{deck_status}..."
+    style_status = _style_status_suffix(deck_state, theme_state)
+    status_message = await _reply_text_with_retry(
+        message,
+        f"กำลังดาวน์โหลดและวิเคราะห์สไลด์ด้วย {provider_label}{style_status}..."
     )
+    if status_message is None:
+        return
     typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
 
     try:
@@ -248,11 +507,13 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
             analysis = await analyzer.analyze_image(
                 image_path,
                 provider,
-                deck_state.style_guide if deck_state.active else None,
+                _active_style_guide(deck_state, theme_state),
             )
             if deck_state.active:
                 deck_state.slide_count += 1
                 analysis = _with_deck_prefix(analysis, deck_state, style_was_created)
+            elif _has_active_theme(theme_state):
+                analysis = _with_theme_prefix(analysis, theme_state)
 
         await status_message.delete()
         await _reply_long_text(message, analysis)
@@ -260,11 +521,9 @@ async def handle_slide_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await status_message.edit_text(
             "อ่านไฟล์ภาพไม่ได้ครับ กรุณาส่งไฟล์ PNG, JPG, JPEG หรือ WebP ที่เปิดได้ตามปกติ"
         )
-    except SlideAnalysisError:
-        logger.exception("Slide analysis failed")
-        await status_message.edit_text(
-            "วิเคราะห์สไลด์ไม่สำเร็จครับ กรุณาลองส่งภาพที่คมชัดกว่าเดิมอีกครั้ง"
-        )
+    except SlideAnalysisError as exc:
+        logger.warning("Slide analysis failed: %s", exc)
+        await status_message.edit_text(_analysis_error_text(exc))
     except TelegramError:
         logger.exception("Telegram API error while handling image")
         with suppress(TelegramError):
@@ -291,10 +550,110 @@ async def handle_slide_document(
         return
 
     if _is_pdf_document(message):
+        theme_state = _get_theme_state(context, message.chat_id)
+        if theme_state.awaiting_template:
+            await handle_theme_template_pdf(update, context)
+            return
+
         await handle_slide_pdf(update, context)
         return
 
     await handle_slide_image(update, context)
+
+
+async def handle_theme_template_pdf(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    analyzer: SlideAnalyzer = context.application.bot_data["slide_analyzer"]
+    provider = _get_selected_provider(context, message.chat_id, settings)
+    theme_state = _get_theme_state(context, message.chat_id)
+
+    try:
+        attachment = _extract_pdf_attachment(message)
+    except UnsupportedPdfError:
+        await message.reply_text("กรุณาส่งภาพหรือ PDF ที่ใช้เป็น theme template ครับ")
+        return
+
+    if attachment.file_size and attachment.file_size > settings.max_pdf_size_bytes:
+        await message.reply_text(
+            f"ไฟล์ PDF ใหญ่เกินไปครับ ขนาดสูงสุดคือ {settings.max_pdf_size_mb} MB"
+        )
+        return
+
+    if not settings.is_provider_available(provider):
+        await message.reply_text(_missing_provider_key_text(settings, provider))
+        return
+
+    provider_label = settings.provider_label(provider)
+    status_message = await _reply_text_with_retry(
+        message,
+        f"กำลังอ่าน theme จาก PDF หน้าแรกด้วย {provider_label}..."
+    )
+    if status_message is None:
+        return
+    typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ai-slide-theme-pdf-") as temp_dir:
+            temp_path = Path(temp_dir)
+            pdf_path = temp_path / attachment.file_name
+            reference_dir = temp_path / "rendered-pages"
+
+            telegram_file = await context.bot.get_file(
+                attachment.file_id,
+                read_timeout=settings.request_timeout_seconds,
+                write_timeout=settings.request_timeout_seconds,
+            )
+            await telegram_file.download_to_drive(custom_path=pdf_path)
+
+            reference_image_paths = await asyncio.to_thread(
+                render_pdf_pages,
+                pdf_path,
+                reference_dir,
+            )
+            style_guide = await analyzer.extract_deck_style(
+                reference_image_paths[0],
+                provider,
+            )
+            _set_theme_from_template(theme_state, style_guide, "Theme จาก PDF ต้นแบบ")
+
+        await status_message.edit_text(
+            _theme_template_saved_text(theme_state),
+            reply_markup=_theme_keyboard(theme_state),
+        )
+    except UnsupportedPdfError:
+        await status_message.edit_text(
+            "อ่านไฟล์ PDF ไม่ได้ครับ กรุณาส่ง PDF ที่เปิดได้ตามปกติ"
+        )
+    except SlideRenderError:
+        logger.exception("Theme template PDF rendering failed")
+        await status_message.edit_text(
+            "แปลง PDF template เป็นภาพไม่สำเร็จครับ กรุณาลอง export PDF ใหม่"
+        )
+    except SlideAnalysisError as exc:
+        logger.warning("Theme template extraction failed: %s", exc)
+        await status_message.edit_text(_analysis_error_text(exc))
+    except TelegramError:
+        logger.exception("Telegram API error while handling theme template PDF")
+        with suppress(TelegramError):
+            await status_message.edit_text(
+                "เกิดปัญหาระหว่างรับส่งไฟล์กับ Telegram กรุณาลองใหม่อีกครั้ง"
+            )
+    except Exception:
+        logger.exception("Unexpected error while handling theme template PDF")
+        await status_message.edit_text(
+            "เกิดข้อผิดพลาดที่ไม่คาดคิด กรุณาลองใหม่อีกครั้ง"
+        )
+    finally:
+        typing_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await typing_task
 
 
 async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -309,6 +668,7 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     provider = _get_selected_provider(context, message.chat_id, settings)
     deck_state = _get_deck_style_state(context, message.chat_id)
+    theme_state = _get_theme_state(context, message.chat_id)
 
     try:
         attachment = _extract_pdf_attachment(message)
@@ -326,11 +686,18 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(_missing_provider_key_text(settings, provider))
         return
 
+    if provider == "ollama":
+        await message.reply_text(_pdf_generation_not_supported_text(settings, provider))
+        return
+
     provider_label = settings.provider_label(provider)
-    deck_status = " และ deck style" if deck_state.active else ""
-    status_message = await message.reply_text(
-        f"กำลังแปลง PDF ทั้ง deck และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}{deck_status}..."
+    style_status = _style_status_suffix(deck_state, theme_state)
+    status_message = await _reply_text_with_retry(
+        message,
+        f"กำลังแปลง PDF ทั้ง deck และสร้างภาพสไลด์ตกแต่งด้วย {provider_label}{style_status}..."
     )
+    if status_message is None:
+        return
     typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
 
     try:
@@ -377,7 +744,7 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     reference_image_path,
                     provider,
                     output_image_path,
-                    deck_state.style_guide if deck_state.active else None,
+                    _active_style_guide(deck_state, theme_state),
                 )
                 output_image_paths.append(output_image_path)
 
@@ -395,6 +762,7 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         deck_state,
                         style_was_created,
                         len(reference_image_paths),
+                        theme_state,
                     ),
                 )
     except UnsupportedPdfError:
@@ -406,6 +774,9 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await status_message.edit_text(
             "แปลง PDF เป็นภาพไม่สำเร็จครับ กรุณาลอง export deck เป็น PDF ใหม่"
         )
+    except SlideImageQuotaError as exc:
+        logger.warning("Decorated slide image generation quota exceeded: %s", exc)
+        await status_message.edit_text(str(exc))
     except SlideImageGenerationError:
         logger.exception("Decorated slide image generation failed")
         await status_message.edit_text(
@@ -429,11 +800,23 @@ async def handle_slide_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def handle_non_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_message:
-        await update.effective_message.reply_text(NON_IMAGE_MESSAGE)
+    message = update.effective_message
+    if message is None:
+        return
+
+    theme_state = _get_theme_state(context, message.chat_id)
+    if theme_state.awaiting_template:
+        await message.reply_text(_theme_template_waiting_text())
+        return
+
+    await message.reply_text(NON_IMAGE_MESSAGE)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        logger.warning("Telegram network error while processing update: %s", context.error)
+        return
+
     logger.exception("Unhandled Telegram update error", exc_info=context.error)
 
 
@@ -443,6 +826,9 @@ def build_application(settings: Settings) -> Application:
         gemini_model=settings.gemini_model,
         openai_api_key=settings.openai_api_key,
         openai_model=settings.openai_model,
+        ollama_base_url=settings.ollama_base_url,
+        ollama_model=settings.ollama_model,
+        request_timeout_seconds=settings.request_timeout_seconds,
     )
     generator = SlideImageGenerator(
         gemini_api_key=settings.gemini_api_key,
@@ -457,10 +843,16 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["slide_image_generator"] = generator
     application.bot_data["chat_ai_providers"] = {}
     application.bot_data["deck_style_states"] = {}
+    application.bot_data["theme_states"] = {}
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("provider", provider_command))
+    application.add_handler(CommandHandler("theme", theme_command))
+    application.add_handler(CommandHandler("themes", theme_command))
+    application.add_handler(CommandHandler("themetemplate", theme_template_command))
+    application.add_handler(CommandHandler("themestatus", theme_status_command))
+    application.add_handler(CommandHandler("themeclear", theme_clear_command))
     application.add_handler(CommandHandler("deckstart", deck_start_command))
     application.add_handler(CommandHandler("deckstatus", deck_status_command))
     application.add_handler(CommandHandler("deckclear", deck_clear_command))
@@ -468,6 +860,12 @@ def build_application(settings: Settings) -> Application:
         CallbackQueryHandler(
             handle_provider_selection,
             pattern=f"^{PROVIDER_CALLBACK_PREFIX}",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_theme_selection,
+            pattern=f"^{THEME_CALLBACK_PREFIX}",
         )
     )
     application.add_handler(MessageHandler(filters.PHOTO, handle_slide_image))
@@ -488,6 +886,10 @@ def _deck_style_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, DeckStyleSt
     return context.application.bot_data.setdefault("deck_style_states", {})
 
 
+def _theme_state_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, ThemeState]:
+    return context.application.bot_data.setdefault("theme_states", {})
+
+
 def _get_deck_style_state(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -496,6 +898,18 @@ def _get_deck_style_state(
     state = states.get(chat_id)
     if state is None:
         state = DeckStyleState()
+        states[chat_id] = state
+    return state
+
+
+def _get_theme_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> ThemeState:
+    states = _theme_state_map(context)
+    state = states.get(chat_id)
+    if state is None:
+        state = ThemeState()
         states[chat_id] = state
     return state
 
@@ -509,6 +923,120 @@ def _get_selected_provider(
     if provider and settings.is_provider_available(provider):
         return provider
     return settings.ai_provider
+
+
+async def _capture_theme_template_from_image(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    analyzer: SlideAnalyzer,
+    provider: str,
+    attachment: FileAttachment,
+    theme_state: ThemeState,
+) -> None:
+    provider_label = settings.provider_label(provider)
+    status_message = await _reply_text_with_retry(
+        message,
+        f"กำลังอ่าน theme จากภาพต้นแบบด้วย {provider_label}..."
+    )
+    if status_message is None:
+        return
+    typing_task = asyncio.create_task(_send_typing_until_done(context, message.chat_id))
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ai-slide-theme-") as temp_dir:
+            image_path = Path(temp_dir) / attachment.file_name
+            telegram_file = await context.bot.get_file(
+                attachment.file_id,
+                read_timeout=settings.request_timeout_seconds,
+                write_timeout=settings.request_timeout_seconds,
+            )
+            await telegram_file.download_to_drive(custom_path=image_path)
+
+            style_guide = await analyzer.extract_deck_style(image_path, provider)
+            _set_theme_from_template(theme_state, style_guide, "Theme จากภาพต้นแบบ")
+
+        await status_message.edit_text(
+            _theme_template_saved_text(theme_state),
+            reply_markup=_theme_keyboard(theme_state),
+        )
+    except UnsupportedImageError:
+        await status_message.edit_text(
+            "อ่านภาพต้นแบบไม่ได้ครับ กรุณาส่งไฟล์ PNG, JPG, JPEG หรือ WebP ที่เปิดได้ตามปกติ"
+        )
+    except SlideAnalysisError as exc:
+        logger.warning("Theme template extraction failed: %s", exc)
+        await status_message.edit_text(_analysis_error_text(exc))
+    except TelegramError:
+        logger.exception("Telegram API error while handling theme template image")
+        with suppress(TelegramError):
+            await status_message.edit_text(
+                "เกิดปัญหาระหว่างรับส่งไฟล์กับ Telegram กรุณาลองใหม่อีกครั้ง"
+            )
+    except Exception:
+        logger.exception("Unexpected error while handling theme template image")
+        await status_message.edit_text(
+            "เกิดข้อผิดพลาดที่ไม่คาดคิด กรุณาลองใหม่อีกครั้ง"
+        )
+    finally:
+        typing_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await typing_task
+
+
+def _set_theme_from_preset(state: ThemeState, preset: ThemePreset) -> None:
+    state.active = True
+    state.label = preset.label
+    state.style_guide = preset.style_guide
+    state.awaiting_template = False
+
+
+def _set_theme_from_template(
+    state: ThemeState,
+    style_guide: str,
+    label: str,
+) -> None:
+    state.active = True
+    state.label = label
+    state.style_guide = style_guide
+    state.awaiting_template = False
+
+
+def _clear_theme_state(state: ThemeState) -> None:
+    state.active = False
+    state.label = None
+    state.style_guide = None
+    state.awaiting_template = False
+
+
+def _has_active_theme(state: ThemeState) -> bool:
+    return state.active and bool(state.style_guide)
+
+
+def _theme_label(state: ThemeState) -> str:
+    return state.label or "Theme ที่เลือก"
+
+
+def _active_style_guide(
+    deck_state: DeckStyleState,
+    theme_state: ThemeState,
+) -> str | None:
+    if deck_state.active and deck_state.style_guide:
+        return deck_state.style_guide
+    if _has_active_theme(theme_state):
+        return theme_state.style_guide
+    return None
+
+
+def _style_status_suffix(
+    deck_state: DeckStyleState,
+    theme_state: ThemeState,
+) -> str:
+    if deck_state.active:
+        return " และ deck style"
+    if _has_active_theme(theme_state):
+        return f" และ theme: {_theme_label(theme_state)}"
+    return ""
 
 
 def _deck_status_text(state: DeckStyleState) -> str:
@@ -549,21 +1077,28 @@ def _with_deck_prefix(
     return f"{prefix}{text}"
 
 
+def _with_theme_prefix(text: str, state: ThemeState) -> str:
+    return f"ใช้ Theme: {_theme_label(state)}\n\n{text}"
+
+
 def _decorated_deck_caption(
     provider_label: str,
     state: DeckStyleState,
     style_was_created: bool,
     page_count: int,
+    theme_state: ThemeState,
 ) -> str:
     caption = (
         f"สร้างภาพสไลด์ตกแต่งจาก PDF ครบ {page_count} หน้าแล้วครับ "
         f"({provider_label})\nส่งกลับเป็น ZIP รวมไฟล์ PNG ทุกหน้า"
     )
-    if not state.active:
-        return caption
-    if style_was_created:
-        return f"{caption}\nบันทึก Deck Style แล้ว และใช้ theme เดียวกันทั้ง deck"
-    return f"{caption}\nใช้ Deck Style เดิมสำหรับหน้า {state.slide_count}"
+    if state.active:
+        if style_was_created:
+            return f"{caption}\nบันทึก Deck Style แล้ว และใช้ theme เดียวกันทั้ง deck"
+        return f"{caption}\nใช้ Deck Style เดิมสำหรับหน้า {state.slide_count}"
+    if _has_active_theme(theme_state):
+        return f"{caption}\nใช้ Theme: {_theme_label(theme_state)}"
+    return caption
 
 
 def _zip_files(file_paths: list[Path], zip_path: Path) -> Path:
@@ -584,6 +1119,7 @@ def _provider_selection_text(settings: Settings, selected_provider: str) -> str:
             "",
             "Gemini เหมาะกับโหมดฟรี/ประหยัด",
             "GPT ใช้ OpenAI API และมีค่าใช้จ่ายตามบัญชี",
+            "Ollama รันในเครื่อง เหมาะกับวิเคราะห์ภาพ แต่ยังไม่รองรับสร้างภาพ PDF",
         ]
     )
 
@@ -595,12 +1131,18 @@ def _provider_selected_text(settings: Settings, provider: str) -> str:
             f"Analysis model: {settings.provider_model(provider)}",
             f"Image model: {settings.provider_image_model(provider)}",
             "",
-            "ส่งภาพสไลด์หรือ PDF draft มาได้เลยครับ",
+            _provider_ready_next_step(provider),
         ]
     )
 
 
 def _missing_provider_key_text(settings: Settings, provider: str) -> str:
+    if provider == "ollama":
+        return (
+            "Ollama ใช้ไม่ได้ครับ กรุณาเปิด Ollama app และตรวจว่าโหลด model แล้ว "
+            "ด้วย `ollama list`"
+        )
+
     key_name = "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
     return "\n".join(
         [
@@ -608,6 +1150,137 @@ def _missing_provider_key_text(settings: Settings, provider: str) -> str:
             f"กรุณาตั้งค่า {key_name} ในไฟล์ .env แล้ว restart bot",
         ]
     )
+
+
+def _provider_ready_next_step(provider: str) -> str:
+    if provider == "ollama":
+        return "ส่งภาพสไลด์มาได้เลยครับ ถ้าจะสร้างภาพจาก PDF ให้ใช้ /provider เลือก Gemini หรือ GPT"
+
+    return "ส่งภาพสไลด์หรือ PDF draft มาได้เลยครับ"
+
+
+def _pdf_generation_not_supported_text(settings: Settings, provider: str) -> str:
+    return "\n".join(
+        [
+            f"{settings.provider_label(provider)} ยังไม่รองรับการสร้างภาพสไลด์จาก PDF ครับ",
+            "",
+            "Ollama/Qwen2.5-VL ใช้ได้กับการวิเคราะห์ภาพและดึง theme จากภาพ/PDF template",
+            "ถ้าต้องการตกแต่ง PDF เป็นภาพสไลด์ ให้ใช้ /provider เลือก Gemini หรือ GPT",
+        ]
+    )
+
+
+def _analysis_error_text(exc: SlideAnalysisError) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+
+    return "วิเคราะห์สไลด์ไม่สำเร็จครับ กรุณาลองใหม่อีกครั้ง"
+
+
+def _theme_selection_text(state: ThemeState) -> str:
+    lines = ["เลือก theme สำหรับสไลด์ถัดไปในแชตนี้", ""]
+    if state.awaiting_template:
+        lines.extend(
+            [
+                "ตอนนี้กำลังรอภาพหรือ PDF ต้นแบบ",
+                "ส่งตัวอย่างธีมมาได้เลย ระบบจะดึง style guide จากไฟล์นั้น",
+                "",
+            ]
+        )
+    elif _has_active_theme(state):
+        lines.extend(["ตอนนี้ใช้:", _theme_label(state), ""])
+    else:
+        lines.extend(["ตอนนี้ยังไม่ได้ lock theme", ""])
+
+    lines.extend(
+        [
+            "เลือก preset ด้านล่าง หรือกดใช้ภาพ/PDF เป็นต้นแบบ",
+            "เมื่อตั้ง theme แล้ว การวิเคราะห์ภาพและการตกแต่ง PDF จะใช้ theme นี้",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _theme_selected_text(state: ThemeState) -> str:
+    return "\n".join(
+        [
+            f"ตั้ง Theme: {_theme_label(state)} แล้ว",
+            "",
+            "ส่งภาพสไลด์หรือ PDF draft มาได้เลย ระบบจะใช้ theme นี้เป็นทิศทางการออกแบบ",
+        ]
+    )
+
+
+def _theme_template_waiting_text() -> str:
+    return "\n".join(
+        [
+            "ส่งภาพหรือ PDF ต้นแบบ theme มาได้เลยครับ",
+            "",
+            "ถ้าส่งภาพ ระบบจะดึง style จากภาพนั้น",
+            "ถ้าส่ง PDF ระบบจะใช้หน้าแรกเป็นต้นแบบ",
+            "หลังบันทึกแล้ว สไลด์ถัดไปจะใช้ theme เดียวกัน",
+        ]
+    )
+
+
+def _theme_template_saved_text(state: ThemeState) -> str:
+    return "\n".join(
+        [
+            f"บันทึก {_theme_label(state)} แล้วครับ",
+            "",
+            "ส่งภาพสไลด์หรือ PDF draft ถัดไปมาได้เลย ระบบจะใช้ theme นี้เป็นต้นแบบ",
+        ]
+    )
+
+
+def _theme_status_text(state: ThemeState) -> str:
+    if state.awaiting_template:
+        return _theme_template_waiting_text()
+
+    if not _has_active_theme(state):
+        return "ยังไม่ได้เลือก theme ครับ ใช้ /theme เพื่อเลือก preset หรือ /themetemplate เพื่อส่งต้นแบบ"
+
+    return "\n".join(
+        [
+            f"Theme ที่ใช้อยู่: {_theme_label(state)}",
+            "",
+            state.style_guide or "",
+        ]
+    )
+
+
+def _theme_keyboard(state: ThemeState) -> InlineKeyboardMarkup:
+    rows = []
+    selected_label = _theme_label(state) if _has_active_theme(state) else None
+    for preset in THEME_PRESETS:
+        selected_prefix = "✓ " if preset.label == selected_label else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{selected_prefix}{preset.label}",
+                    callback_data=f"{THEME_CALLBACK_PREFIX}{preset.key}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "ใช้ภาพ/PDF เป็นต้นแบบ",
+                callback_data=f"{THEME_CALLBACK_PREFIX}template",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "ล้าง theme",
+                callback_data=f"{THEME_CALLBACK_PREFIX}clear",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def _provider_keyboard(settings: Settings, selected_provider: str) -> InlineKeyboardMarkup:
@@ -685,7 +1358,33 @@ def _extract_image_attachment(message: Message) -> FileAttachment:
 
 async def _reply_long_text(message: Message, text: str) -> None:
     for chunk in _split_text(text):
-        await message.reply_text(chunk)
+        if await _reply_text_with_retry(message, chunk) is None:
+            return
+
+
+async def _reply_text_with_retry(
+    message: Message,
+    text: str,
+    *,
+    attempts: int = 3,
+    **kwargs: Any,
+) -> Message | None:
+    for attempt in range(1, attempts + 1):
+        try:
+            return await message.reply_text(text, **kwargs)
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+        except (NetworkError, TimedOut) as exc:
+            if attempt >= attempts:
+                logger.warning(
+                    "Could not send Telegram message after %s attempts: %s",
+                    attempts,
+                    exc,
+                )
+                return None
+            await asyncio.sleep(attempt)
+
+    return None
 
 
 def _split_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
@@ -741,7 +1440,10 @@ async def _send_typing_until_done(
     chat_id: int,
 ) -> None:
     while True:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except (NetworkError, TimedOut) as exc:
+            logger.warning("Could not send Telegram typing action: %s", exc)
         await asyncio.sleep(4)
 
 
@@ -753,12 +1455,15 @@ def main() -> None:
     logger.info(
         "Starting AI Slide Designer Agent provider=%s "
         "gemini_model=%s gemini_image_model=%s "
-        "openai_model=%s openai_image_model=%s",
+        "openai_model=%s openai_image_model=%s "
+        "ollama_model=%s ollama_base_url=%s",
         settings.ai_provider,
         settings.gemini_model,
         settings.gemini_image_model,
         settings.openai_model,
         settings.openai_image_model,
+        settings.ollama_model,
+        settings.ollama_base_url,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

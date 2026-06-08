@@ -1,6 +1,6 @@
 # AI Slide Designer Agent
 
-MVP Telegram bot that analyzes PowerPoint slide screenshots/images with selectable Gemini or GPT vision APIs, and can turn every page of a slide-draft PDF into a decorated presentation-ready PNG deck.
+MVP Telegram bot that analyzes PowerPoint slide screenshots/images with selectable Gemini, GPT, or Ollama local vision providers, and can turn every page of a slide-draft PDF into a decorated presentation-ready PNG deck with Gemini or GPT image models.
 
 ## Features
 
@@ -10,7 +10,9 @@ MVP Telegram bot that analyzes PowerPoint slide screenshots/images with selectab
 - Downloads and validates the uploaded image
 - Normalizes images with Pillow before analysis
 - Lets each chat choose AI provider with `/provider`
-- Sends the slide image to Google Gemini or OpenAI GPT vision
+- Lets each chat choose a slide theme with `/theme`
+- Lets each chat send a slide/PDF as a theme template with `/themetemplate`
+- Sends the slide image to Google Gemini, OpenAI GPT vision, or Ollama local vision
 - Generates a polished decorated slide image from a PDF draft
 - Returns Thai feedback covering layout, hierarchy, readability, typography, color, professionalism, and presentation effectiveness
 - Includes a design score breakdown and an English image-generation prompt
@@ -35,7 +37,7 @@ ai-slide-designer-bot/
 
 - Python 3.11+
 - Telegram bot token from BotFather
-- Gemini API key from Google AI Studio, OpenAI API key, or both
+- Gemini API key from Google AI Studio, OpenAI API key, Ollama local, or a combination of these
 
 ## Installation
 
@@ -65,13 +67,18 @@ GEMINI_MODEL=gemini-2.5-flash
 GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
 OPENAI_MODEL=gpt-4.1-mini
 OPENAI_IMAGE_MODEL=gpt-image-2
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5vl:3b
 LOG_LEVEL=INFO
 MAX_IMAGE_SIZE_MB=15
 MAX_PDF_SIZE_MB=25
 REQUEST_TIMEOUT_SECONDS=120
 ```
 
-Set `AI_PROVIDER=gemini` or `AI_PROVIDER=gpt` only when you want to force the startup default. If it is blank, the bot uses Gemini when `GEMINI_API_KEY` exists, otherwise GPT when `OPENAI_API_KEY` exists.
+Set `AI_PROVIDER=gemini`, `AI_PROVIDER=gpt`, or `AI_PROVIDER=ollama` only when
+you want to force the startup default. If it is blank, the bot uses Gemini when
+`GEMINI_API_KEY` exists, otherwise GPT when `OPENAI_API_KEY` exists, otherwise
+Ollama local.
 
 ## Run
 
@@ -88,8 +95,36 @@ Use `/provider` in Telegram to choose the API for the current chat:
 
 - Gemini (ฟรี/โควตาฟรี): uses `GEMINI_API_KEY`, `GEMINI_MODEL`, and `GEMINI_IMAGE_MODEL`
 - GPT (เสียเงิน): uses `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_IMAGE_MODEL`
+- Ollama Local (ฟรี/รันในเครื่อง): uses `OLLAMA_BASE_URL` and `OLLAMA_MODEL`
 
 The selection is stored in memory, so restarting the bot resets chats back to `AI_PROVIDER`.
+
+For Ollama local vision analysis, install/open Ollama and pull the local vision
+model:
+
+```bash
+ollama pull qwen2.5vl:3b
+open -a Ollama --args hidden
+```
+
+Ollama supports slide image analysis and theme-template extraction. It does not
+generate decorated slide images from PDFs; use Gemini or GPT for PDF decoration.
+
+## Theme Selection
+
+Use `/theme` in Telegram to choose a preset theme for the current chat. The
+selected theme is passed into both slide analysis and PDF slide decoration.
+
+Available commands:
+
+- `/theme` or `/themes`: show preset theme buttons
+- `/themetemplate`: wait for a slide image or PDF to use as a theme template
+- `/themestatus`: show the active theme/style guide
+- `/themeclear`: clear the selected theme
+
+When using `/themetemplate`, send a slide image or a PDF after the command. If a
+PDF is sent, the first page is used as the template. Theme state is stored in
+memory, so restarting the bot clears it.
 
 ## Deck Style Lock
 
@@ -108,7 +143,7 @@ Send a PDF document to the bot. The bot will:
 
 1. Download the PDF from Telegram
 2. Render every page to `slide-draft-page-001.png`, `slide-draft-page-002.png`, etc. with PyMuPDF
-3. Use the selected AI provider to generate a cleaner, decorated 16:9 slide image for each page
+3. Use the selected Gemini or GPT image provider to generate a cleaner, decorated 16:9 slide image for each page
 4. Return `decorated-slide-deck.zip` as a Telegram document to avoid image compression
 
 For multi-page PDFs, every page is processed sequentially. Large decks can take several minutes because each page requires a separate image-generation request.

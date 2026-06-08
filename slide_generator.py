@@ -26,6 +26,10 @@ class SlideImageGenerationError(Exception):
     """Raised when an AI provider cannot generate a decorated slide image."""
 
 
+class SlideImageQuotaError(SlideImageGenerationError):
+    """Raised when an AI provider rejects image generation because of quota."""
+
+
 class SlideImageGenerator:
     def __init__(
         self,
@@ -69,6 +73,11 @@ class SlideImageGenerator:
             return self._generate_gemini_image(reference_image_path, output_path, prompt)
         if provider == "gpt":
             return self._generate_openai_image(reference_image_path, output_path, prompt)
+        if provider == "ollama":
+            raise SlideImageGenerationError(
+                "Ollama local ยังไม่รองรับ image generation ครับ "
+                "ใช้ /provider เลือก Gemini หรือ GPT สำหรับสร้างภาพจาก PDF"
+            )
 
         raise SlideImageGenerationError(f"Unsupported AI provider: {provider}")
 
@@ -93,6 +102,12 @@ class SlideImageGenerator:
                 contents=[prompt, reference_image],
             )
         except Exception as exc:
+            if _is_quota_error(exc):
+                raise SlideImageQuotaError(
+                    "Gemini image generation quota เต็มหรือยังใช้ไม่ได้บน free tier "
+                    "สำหรับ model นี้ครับ ใช้ /provider เลือก GPT หรือเปิด billing "
+                    "ใน Google AI Studio/Google Cloud แล้วลองใหม่"
+                ) from exc
             raise SlideImageGenerationError("Gemini image generation failed.") from exc
 
         for part in _iter_gemini_parts(response):
@@ -128,6 +143,11 @@ class SlideImageGenerator:
                     quality=OPENAI_IMAGE_QUALITY,
                 )
         except Exception as exc:
+            if _is_quota_error(exc):
+                raise SlideImageQuotaError(
+                    "GPT image generation quota/rate limit เต็มครับ "
+                    "ตรวจ billing หรือรอสักครู่แล้วลองใหม่"
+                ) from exc
             raise SlideImageGenerationError("OpenAI image generation failed.") from exc
 
         image_base64 = result.data[0].b64_json if result.data else None
@@ -168,6 +188,24 @@ def _iter_gemini_parts(response: object) -> Iterable[object]:
         content = getattr(candidate, "content", None)
         candidate_parts.extend(getattr(content, "parts", None) or [])
     return candidate_parts
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+
+    message = str(exc).lower()
+    return any(
+        text in message
+        for text in (
+            "429",
+            "too many requests",
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+        )
+    )
 
 
 def _part_has_inline_image(part: object) -> bool:

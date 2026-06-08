@@ -102,8 +102,8 @@ def build_analysis_prompt(deck_style_guide: str | None = None) -> str:
     return f"""
 {SYSTEM_PROMPT}
 
-Deck Style Lock:
-Use the following deck style guide as a strict visual direction for this slide.
+Style Lock:
+Use the following style guide as a strict visual direction for this slide.
 For Theme Recommendation and the final English image-generation prompt, keep
 the same colors, typography direction, layout language, visual elements, and
 overall mood. Do not propose a conflicting new theme.
@@ -140,9 +140,9 @@ def build_slide_decoration_prompt(deck_style_guide: str | None = None) -> str:
     return f"""
 {SLIDE_DECORATION_PROMPT}
 
-Deck Style Lock:
-Apply this exact deck style guide so the generated image matches the rest of
-the deck. Keep color palette, typography direction, layout system, decorative
+Style Lock:
+Apply this exact style guide so the generated image matches the requested
+theme. Keep color palette, typography direction, layout system, decorative
 motifs, icon/illustration style, background treatment, spacing, and visual mood
 consistent. Do not switch to a different theme.
 
