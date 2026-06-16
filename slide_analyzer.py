@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from io import BytesIO
 from pathlib import Path
 from urllib import error as url_error
@@ -21,15 +22,109 @@ logger = logging.getLogger(__name__)
 
 MAX_IMAGE_DIMENSION = 2400
 JPEG_QUALITY = 92
+REFERENCE_PROMPT_PREFIX = "Use the provided slide image as the primary visual reference."
 OLLAMA_PROMPT_SUFFIX = """
 
-Additional instruction for Ollama: Do not repeat these instructions. Follow the
-requested output structure exactly and always include the final section title
-"Prompt สำหรับสร้างภาพใหม่:" followed by one professional English prompt that
-another image generator can use to redesign the slide. Replace any placeholder
-or parenthetical instruction in that section with the actual prompt. Do not
-claim that you generated an image; return text analysis and the prompt only.
+Ollama note: write Thai critique only, no Chinese characters. Fill every field.
+In the final prompt section, write only the actual English image-edit prompt.
+It must begin with: Use the provided slide image as the primary visual reference.
+Do not write a generic preservation prompt. Name concrete visible details from
+the slide: readable text, object counts, positions, colors, shapes, connectors,
+callouts, charts, tables, and any icons you can see.
 """.rstrip()
+OLLAMA_REFERENCE_PROMPT_REPAIR = f"""
+You are writing ONLY one professional English image-edit prompt for a slide
+redesign image model.
+
+Look carefully at the uploaded slide screenshot. The prompt will be used
+together with this same screenshot as the image reference.
+
+Requirements:
+- Start exactly with: "{REFERENCE_PROMPT_PREFIX}"
+- Describe the actual visible slide, not a generic template.
+- Write as an instruction to an image-edit model, not as critique or analysis.
+- Include concrete details you can see: readable text, number of main elements,
+  positions, colors, shapes, connectors, callouts/buttons, charts/tables/icons,
+  background, title/subtitle placement, and spacing.
+- It is okay to quote visible Thai slide text inside the English prompt.
+- Preserve the original topic, all readable text, layout structure, color
+  palette, visual hierarchy, and template identity.
+- Improve only professional polish: alignment, spacing, typography, contrast,
+  hierarchy, and subtle decoration.
+- Do not add unrelated imagery, fake data, new logos, new claims, or a different
+  theme.
+- Return one paragraph only. Do not add labels, markdown, explanations, or
+  placeholders.
+""".strip()
+PROMPT_SECTION_TITLE = "Prompt สำหรับสร้างภาพใหม่:"
+CJK_PATTERN = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+THAI_PATTERN = re.compile(r"[\u0e00-\u0e7f]")
+CONCRETE_REFERENCE_PATTERN = re.compile(
+    r"\b("
+    r"circle|rounded|button|callout|timeline|workflow|flow|arrow|connector|"
+    r"red|blue|purple|green|teal|orange|yellow|pink|white|gray|grey|black|"
+    r"top|bottom|left|right|center|middle|header|headline|subtitle|footer|"
+    r"label|badge|card|box|diagram|icon|table|chart|photo|image|step|pill"
+    r")\b",
+    re.IGNORECASE,
+)
+PROMPT_DIAGNOSTIC_PHRASES = (
+    "score",
+    "difficult to see",
+    "hard to read",
+    "poor alignment",
+    "visually appealing",
+    "look cluttered",
+    "looks cluttered",
+    "could benefit",
+    "might be improved",
+    "may be difficult",
+    "lacks",
+)
+INSTRUCTION_LEAK_MARKERS = (
+    "Continue with concrete details",
+    "Style Lock:",
+    "Use the following style guide",
+    "Private style guidance",
+    "Ollama note:",
+    "Additional instruction",
+    "requested output structure",
+    "followed by one professional English prompt",
+)
+REFERENCE_PROMPT_FALLBACK = (
+    "Use the provided slide image as the primary visual reference. Recreate the "
+    "same slide template instead of inventing a new concept: keep the exact 16:9 "
+    "canvas, light background, title/subtitle/header areas, same number of main "
+    "diagram/chart/table elements, same shape types, approximate element sizes, "
+    "connectors, labels, callout/button areas, and original color palette. "
+    "Preserve every readable text string exactly as shown; if exact text "
+    "rendering is uncertain, keep the text blocks, spacing, and hierarchy "
+    "faithful to the reference instead of inventing replacements. Improve only "
+    "professional polish: cleaner alignment, more balanced spacing, sharper "
+    "typography, stronger contrast, clearer hierarchy, and subtle decoration "
+    "that matches the existing visual style. Do not add unrelated imagery, fake "
+    "data, new logos, new claims, or a different theme."
+)
+REFERENCE_EDIT_CONSTRAINTS = (
+    " Preserve every readable text string exactly as shown, keep the same number "
+    "of visible elements and their approximate positions, preserve the original "
+    "color palette and template identity, and improve only professional polish: "
+    "alignment, spacing, typography, contrast, hierarchy, and subtle decoration. "
+    "Do not add unrelated imagery, fake data, new logos, new claims, or a "
+    "different theme."
+)
+BLANK_FIELD_DEFAULTS = {
+    "Header": "ใช้หัวสไลด์สำหรับชื่อเรื่องหลักที่อ่านชัดและวางแนวให้สอดคล้องกับธีม",
+    "Content": "จัดกลุ่มเนื้อหาหลักให้เป็นบล็อกที่สแกนง่ายและมีลำดับความสำคัญชัดเจน",
+    "Visual": "คงองค์ประกอบภาพเดิมและเพิ่มเฉพาะ visual accent ที่ช่วยเน้นข้อมูล",
+    "Footer": "ใช้พื้นที่ท้ายสไลด์อย่างเรียบง่ายสำหรับหมายเหตุ แหล่งที่มา หรือปล่อยว่างถ้าไม่จำเป็น",
+    "Suggested infographic": "ใช้ infographic แบบเรียบง่ายที่รักษาโครงข้อมูลเดิมและช่วยเน้นประเด็นหลัก",
+    "Suggested illustration": "ใช้ภาพประกอบหรือ accent ที่สอดคล้องกับเนื้อหาโดยไม่เปลี่ยนธีมของสไลด์",
+    "Suggested icon style": "ใช้ไอคอนเส้นบางหรือ duotone ที่สะอาดและสอดคล้องกับ Clean Corporate",
+    "Colors": "คงโทนสีหลักจากสไลด์เดิม เพิ่ม contrast เฉพาะจุดที่ต้องการเน้น",
+    "Typography": "ใช้ sans-serif ที่อ่านง่าย เพิ่มน้ำหนักหัวข้อและจัดขนาดตัวอักษรให้เป็นลำดับ",
+    "Design Style": "Clean Corporate แบบเรียบ โปร่ง มี grid ชัด และใช้ accent อย่างประหยัด",
+}
 
 
 class SlideAnalysisError(Exception):
@@ -158,13 +253,51 @@ class SlideAnalyzer:
         prompt: str,
     ) -> str:
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        text = self._request_ollama_generate(
+            prompt=f"{prompt}{OLLAMA_PROMPT_SUFFIX}",
+            image_base64=image_base64,
+            temperature=0.2,
+            purpose="analysis",
+        )
+
+        reference_prompt = None
+        if _needs_reference_prompt_repair(text):
+            logger.info("Repairing generic Ollama reference prompt model=%s", self._ollama_model)
+            try:
+                reference_prompt = self._generate_ollama_reference_prompt(image_base64)
+            except SlideAnalysisError:
+                logger.warning("Ollama reference prompt repair failed", exc_info=True)
+
+        return _clean_ollama_response(text, reference_prompt=reference_prompt)
+
+    def _generate_ollama_reference_prompt(self, image_base64: str) -> str:
+        prompt = self._request_ollama_generate(
+            prompt=OLLAMA_REFERENCE_PROMPT_REPAIR,
+            image_base64=image_base64,
+            temperature=0.1,
+            purpose="reference_prompt",
+        )
+        prompt = _normalize_reference_prompt(prompt)
+        if _is_bad_reference_prompt(prompt):
+            return REFERENCE_PROMPT_FALLBACK
+
+        return prompt
+
+    def _request_ollama_generate(
+        self,
+        *,
+        prompt: str,
+        image_base64: str,
+        temperature: float,
+        purpose: str,
+    ) -> str:
         payload = {
             "model": self._ollama_model,
-            "prompt": f"{prompt}{OLLAMA_PROMPT_SUFFIX}",
+            "prompt": prompt,
             "images": [image_base64],
             "stream": False,
             "options": {
-                "temperature": 0.2,
+                "temperature": temperature,
             },
         }
         request = url_request.Request(
@@ -174,7 +307,11 @@ class SlideAnalyzer:
             method="POST",
         )
 
-        logger.info("Sending slide image to Ollama model=%s", self._ollama_model)
+        logger.info(
+            "Sending slide image to Ollama model=%s purpose=%s",
+            self._ollama_model,
+            purpose,
+        )
         try:
             with url_request.urlopen(
                 request,
@@ -243,6 +380,160 @@ class SlideAnalyzer:
             return background
 
         return image.convert("RGB")
+
+
+def _clean_ollama_response(text: str, reference_prompt: str | None = None) -> str:
+    text = _remove_cjk_lines(text)
+    text = _fill_blank_fields(text)
+    return _clean_ollama_prompt_section(text, reference_prompt)
+
+
+def _remove_cjk_lines(text: str) -> str:
+    cleaned_lines = []
+    for line in text.splitlines():
+        if not CJK_PATTERN.search(line):
+            cleaned_lines.append(line)
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith(("1.", "2.", "3.")):
+            prefix = stripped[:2]
+            cleaned_lines.append(
+                f"{prefix} ปรับข้อความสำคัญให้โดดเด่นขึ้นด้วยน้ำหนักตัวอักษร สี หรือพื้นที่ว่าง"
+            )
+        elif stripped.startswith("*"):
+            cleaned_lines.append("* ปรับรายละเอียดนี้ให้ชัดเจนขึ้นโดยยึดจากภาพต้นแบบ")
+        else:
+            cleaned_lines.append("ปรับรายละเอียดนี้ให้ชัดเจนขึ้นโดยยึดจากภาพต้นแบบ")
+
+    return "\n".join(cleaned_lines)
+
+
+def _fill_blank_fields(text: str) -> str:
+    for field, default in BLANK_FIELD_DEFAULTS.items():
+        pattern = re.compile(rf"(\* {re.escape(field)}:)[ \t]*$", re.MULTILINE)
+        text = pattern.sub(rf"\1 {default}", text)
+    return text
+
+
+def _needs_reference_prompt_repair(text: str) -> bool:
+    if PROMPT_SECTION_TITLE not in text:
+        return True
+
+    _, prompt = text.rsplit(PROMPT_SECTION_TITLE, 1)
+    prompt = _normalize_reference_prompt(prompt)
+    return _is_bad_reference_prompt(prompt)
+
+
+def _clean_ollama_prompt_section(
+    text: str,
+    reference_prompt: str | None = None,
+) -> str:
+    replacement_prompt = (
+        _ensure_reference_edit_constraints(_normalize_reference_prompt(reference_prompt))
+        if reference_prompt
+        else REFERENCE_PROMPT_FALLBACK
+    )
+
+    if PROMPT_SECTION_TITLE not in text:
+        return f"{text.rstrip()}\n\n{PROMPT_SECTION_TITLE}\n{replacement_prompt}"
+
+    body, prompt = text.rsplit(PROMPT_SECTION_TITLE, 1)
+    prompt = _normalize_reference_prompt(prompt)
+
+    if _is_bad_reference_prompt(prompt):
+        prompt = replacement_prompt
+    else:
+        prompt = _ensure_reference_edit_constraints(prompt)
+
+    return f"{body.rstrip()}\n\n{PROMPT_SECTION_TITLE}\n{prompt.strip()}"
+
+
+def _normalize_reference_prompt(prompt: str | None) -> str:
+    if not prompt:
+        return REFERENCE_PROMPT_FALLBACK
+
+    prompt = _remove_instruction_leak(prompt).strip()
+    prompt = _remove_prompt_diagnostic_sentences(prompt)
+    prompt = re.sub(r"\s+", " ", prompt).strip().strip('"').strip()
+
+    if not prompt:
+        return REFERENCE_PROMPT_FALLBACK
+
+    if not prompt.startswith(REFERENCE_PROMPT_PREFIX):
+        prompt = f"{REFERENCE_PROMPT_PREFIX} {prompt}"
+
+    return prompt
+
+
+def _ensure_reference_edit_constraints(prompt: str) -> str:
+    lower_prompt = prompt.lower()
+    if (
+        "preserve every readable text" in lower_prompt
+        and "improve only professional polish" in lower_prompt
+    ):
+        return prompt
+
+    return f"{prompt.rstrip().rstrip('.')}.{REFERENCE_EDIT_CONSTRAINTS}"
+
+
+def _remove_prompt_diagnostic_sentences(prompt: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", prompt.strip())
+    cleaned_sentences = [
+        sentence
+        for sentence in sentences
+        if not any(phrase in sentence.lower() for phrase in PROMPT_DIAGNOSTIC_PHRASES)
+    ]
+
+    return " ".join(cleaned_sentences).strip() or prompt
+
+
+def _remove_instruction_leak(prompt: str) -> str:
+    for marker in INSTRUCTION_LEAK_MARKERS:
+        marker_index = prompt.find(marker)
+        if marker_index != -1:
+            prompt = prompt[:marker_index]
+
+    return prompt.strip().strip('"').strip()
+
+
+def _is_bad_reference_prompt(prompt: str) -> bool:
+    if len(prompt) < 180:
+        return True
+
+    if any(marker in prompt for marker in INSTRUCTION_LEAK_MARKERS):
+        return True
+
+    if "placeholder" in prompt.lower() or "do not copy instructions" in prompt.lower():
+        return True
+
+    if _looks_generic_reference_prompt(prompt):
+        return True
+
+    return False
+
+
+def _looks_generic_reference_prompt(prompt: str) -> bool:
+    lower_prompt = prompt.lower()
+    generic_markers = sum(
+        phrase in lower_prompt
+        for phrase in (
+            "preserve all readable text",
+            "same 16:9 composition",
+            "layout structure",
+            "content hierarchy",
+            "color palette",
+            "background treatment",
+            "visual style from the reference",
+            "improve only professional polish",
+        )
+    )
+    concrete_markers = len(CONCRETE_REFERENCE_PATTERN.findall(prompt))
+
+    if THAI_PATTERN.search(prompt):
+        concrete_markers += 2
+
+    return generic_markers >= 4 and concrete_markers < 4
 
 
 def _provider_request_error_text(provider_label: str, exc: Exception) -> str:
